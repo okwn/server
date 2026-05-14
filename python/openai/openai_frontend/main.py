@@ -33,6 +33,7 @@ from functools import partial
 
 import tritonserver
 from engine.triton_engine import TritonLLMEngine
+from frontend.fastapi.middleware.request_size_limit import DEFAULT_MAX_INPUT_SIZE
 from frontend.fastapi_frontend import FastApiFrontend
 
 
@@ -197,6 +198,18 @@ def parse_args():
         action="append",
         help="Restrict access to specific OpenAI API endpoints. Format: '<API_1>,<API_2>,... <restricted-key> <restricted-value>' (e.g., 'inference,model-repository admin-key admin-value'). If not specified, all endpoints are allowed.",
     )
+    openai_group.add_argument(
+        "--http-max-input-size",
+        type=int,
+        default=DEFAULT_MAX_INPUT_SIZE,
+        help=(
+            "Maximum allowed request body size in bytes for the OpenAI "
+            "frontend. Requests with bodies larger than this limit are "
+            f"rejected with HTTP 413 before being parsed. Default is "
+            f"{DEFAULT_MAX_INPUT_SIZE} bytes (64 MiB), matching core Triton's "
+            "--http-max-input-size."
+        ),
+    )
 
     # KServe Predict v2 Frontend
     kserve_group = parser.add_argument_group("Triton KServe Frontend")
@@ -223,6 +236,13 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    if args.http_max_input_size <= 0:
+        print(
+            "Error: --http-max-input-size must be greater than 0.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     # Initialize a Triton Inference Server pointing at LLM models
     model_control_mode = (
@@ -269,6 +289,7 @@ def main():
             port=args.openai_port,
             log_level=args.uvicorn_log_level,
             restricted_apis=args.openai_restricted_api,
+            max_input_size=args.http_max_input_size,
         )
     except ValueError as e:
         print(

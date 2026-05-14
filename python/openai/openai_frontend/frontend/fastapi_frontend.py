@@ -34,6 +34,10 @@ from frontend.fastapi.middleware.api_restriction import (
     APIRestrictionMiddleware,
     RestrictedFeatures,
 )
+from frontend.fastapi.middleware.request_size_limit import (
+    DEFAULT_MAX_INPUT_SIZE,
+    RequestSizeLimitMiddleware,
+)
 from frontend.fastapi.routers import (
     chat,
     completions,
@@ -53,10 +57,16 @@ class FastApiFrontend(OpenAIFrontend):
         port: int = 8000,
         log_level: str = "info",
         restricted_apis: list = None,
+        max_input_size: int = DEFAULT_MAX_INPUT_SIZE,
     ):
+        if max_input_size <= 0:
+            raise ValueError(
+                f"max_input_size must be greater than 0, got {max_input_size}"
+            )
         self.host: str = host
         self.port: int = port
         self.log_level: str = log_level
+        self.max_input_size: int = int(max_input_size)
         if restricted_apis:
             self.restricted_apis: RestrictedFeatures = RestrictedFeatures(
                 restricted_apis
@@ -111,6 +121,10 @@ class FastApiFrontend(OpenAIFrontend):
         self._add_cors_middleware(app)
         if self.restricted_apis != None:
             self._add_api_restriction_middleware(app)
+        # Add the request size limit last so it ends up as the outermost
+        # middleware and rejects oversized bodies before any other middleware
+        # or route handler attempts to read or buffer the request.
+        self._add_request_size_limit_middleware(app)
 
         return app
 
@@ -136,4 +150,12 @@ class FastApiFrontend(OpenAIFrontend):
         )
         print(
             f"[INFO] API restrictions enabled. Restricted API endpoints: {self.restricted_apis.RestrictionDict()}"
+        )
+
+    def _add_request_size_limit_middleware(self, app: FastAPI):
+        app.add_middleware(
+            RequestSizeLimitMiddleware, max_input_size=self.max_input_size
+        )
+        print(
+            f"[INFO] Maximum allowed request body size: {self.max_input_size} bytes"
         )

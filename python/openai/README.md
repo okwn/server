@@ -949,3 +949,18 @@ curl -H "api-key: my-secret-key" \
 # Multiple APIs in single argument with shared authentication
 --openai-restricted-api "inference,model-repository shared-key shared-secret"
 ```
+
+## Limit Request Body Size
+
+The OpenAI-compatible frontend rejects requests whose `Content-Length`
+exceeds `--http-max-input-size` (default `67108864` bytes / 64 MiB,
+matching core Triton's `--http-max-input-size`). Oversized requests are
+returned `HTTP 413` before any body bytes are buffered or parsed, which
+prevents a single large JSON payload from OOM-killing the frontend.
+
+```bash
+python3 openai_frontend/main.py \
+  --model-repository /path/to/models \
+  --tokenizer meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --http-max-input-size 67108864
+```
