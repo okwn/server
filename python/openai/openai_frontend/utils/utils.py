@@ -25,6 +25,10 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 from enum import IntEnum
+import argparse
+
+# Default maximum allowed HTTP request input size in bytes (64 MiB).
+HTTP_DEFAULT_MAX_INPUT_SIZE: int = 1 << 26
 
 
 class ServerError(Exception):
@@ -44,4 +48,17 @@ class StatusCode(IntEnum):
     CLIENT_ERROR = 400
     AUTHORIZATION_ERROR = 401
     NOT_FOUND = 404
+    CONTENT_TOO_LARGE = 413
     SERVER_ERROR = 500
+
+
+
+def validate_positive_int(value: object) -> int:
+    try:
+        ivalue = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"value is not an integer")
+    
+    if ivalue <= 0:
+        raise argparse.ArgumentTypeError(f"value must be greater than 0")
+    return ivalue

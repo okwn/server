@@ -949,3 +949,57 @@ curl -H "api-key: my-secret-key" \
 # Multiple APIs in single argument with shared authentication
 --openai-restricted-api "inference,model-repository shared-key shared-secret"
 ```
+
+## Limit HTTP Request Body Size
+
+The OpenAI-compatible frontend rejects requests whose body exceeds the
+configured limit *before* FastAPI deserializes the JSON into Python
+objects. Without this cap a single oversized request can OOM-kill the
+worker, because Pydantic/JSON parsing typically amplifies the body's
+memory footprint by roughly 8x.
+
+### Configuration
+
+Use the `--http-max-input-size` command-line argument:
+
+```bash
+python3 openai_frontend/main.py \
+  --model-repository /path/to/models \
+  --tokenizer meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --http-max-input-size 67108864
+```
+
+- **Default**: `67108864` bytes (64 MiB), matching core Triton's
+  `--http-max-input-size`.
+- **Units**: bytes; must be a positive integer.
+- **Scope**: applies to every endpoint registered on the frontend
+  (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
+  `/v1/models/*`, `/health/ready`, `/metrics`, ...) without per-route
+  wiring.
+
+### Rejection Behavior
+
+| Condition | HTTP status | `error.code` |
+| --- | --- | --- |
+| `Content-Length` header exceeds the limit | `413 Content Too Large` | `content_too_large` |
+| `Transfer-Encoding: chunked` body exceeds the limit during streaming | `413 Content Too Large` | `content_too_large` |
+| `Content-Length` is not an integer or is negative | `400 Bad Request` | `invalid_content_length` |
+
+All rejections use the OpenAI-style error envelope:
+
+```json
+{
+  "error": {
+    "message": "Request content size exceeds the maximum allowed input size of 67108864 bytes. Use --http-max-input-size to increase the limit.",
+    "type": "invalid_request_error",
+    "code": "content_too_large"
+  }
+}
+```
+
+### Defense in Depth
+
+This middleware is the application-layer defense. For production
+deployments behind a reverse proxy, also configure a body-size limit
+there (e.g., nginx `client_max_body_size`) so traffic is rejected at the
+network boundary before reaching the Python process.
