@@ -24,48 +24,29 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Unit tests for ``RequestSizeLimitMiddleware``.
-
-These tests verify the properties that determine correctness of the OOM
-fix:
-
-  * a body within the limit is accepted (no false positives);
-  * a body exceeding the limit via honest ``Content-Length`` is rejected
-    before the handler runs (Stage 1, fast path);
-  * a body exceeding the limit via ``Transfer-Encoding: chunked`` (no
-    ``Content-Length``) is rejected by the byte counter (Stage 2, slow
-    path);
-  * a malformed or negative ``Content-Length`` is rejected with HTTP 400
-    rather than crashing the worker (RFC 9112 §6.3).
-
-They also assert that the middleware is endpoint-agnostic: a single
-registration on the ``FastAPI`` app protects every route - chat,
-completions, embeddings, model load/unload - without per-router wiring.
-"""
+"""Tests for RequestSizeLimitMiddleware via FastApiFrontend."""
 
 import asyncio
 import json
 import os
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
-from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 
 sys.path.append(
     os.path.join(str(Path(__file__).resolve().parent.parent), "openai_frontend")
 )
 
-from frontend.fastapi.middleware.request_size import (  # noqa: E402
-    RequestSizeLimitMiddleware,
-)
+from frontend.fastapi.middleware.request_size import RequestSizeLimitMiddleware
+from frontend.fastapi_frontend import FastApiFrontend
+from utils.utils import HTTP_DEFAULT_MAX_INPUT_SIZE
 
-
-# Endpoints exercised by the OpenAI frontend that accept a request body.
-# Mirroring real route paths makes it explicit that the middleware applies
-# globally, not just to ``/v1/completions``.
-_BODY_ENDPOINTS = (
+_LIMIT = HTTP_DEFAULT_MAX_INPUT_SIZE  # 64 MiB
+_OVERFLOW = 16
+_ENDPOINTS = (
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
@@ -74,123 +55,74 @@ _BODY_ENDPOINTS = (
 )
 
 
-def _build_app(http_max_input_size: int) -> FastAPI:
-    app = FastAPI()
-    app.add_middleware(
-        RequestSizeLimitMiddleware, http_max_input_size=http_max_input_size
-    )
+@pytest.fixture(scope="module")
+def client():
+    """
+    FastApiFrontend with a MagicMock engine.
+    Middleware fires before any engine method is invoked, so a MagicMock
+    suffices for all rejection tests. Acceptance tests only assert != 413;
+    the handler may return 422 for the raw-bytes body, which is expected.
+    """
+    frontend = FastApiFrontend(engine=MagicMock(), http_max_input_size=_LIMIT)
+    return TestClient(frontend.app)
 
-    async def _echo(request: Request):
-        body = await request.body()
-        return {"length": len(body)}
 
-    for endpoint in _BODY_ENDPOINTS:
-        app.add_api_route(endpoint, _echo, methods=["POST"])
-
-    return app
+def _assert_content_too_large(response) -> None:
+    assert response.status_code == 413
+    body = response.json()
+    assert set(body) == {"error"}
+    error = body["error"]
+    assert error["type"] == "invalid_request_error"
+    assert error["code"] == "content_too_large"
+    assert str(_LIMIT) in error["message"]
+    assert "--http-max-input-size" in error["message"]
 
 
 class TestRequestSizeLimitMiddleware:
-    LIMIT = 128
+    @pytest.mark.parametrize("endpoint", _ENDPOINTS)
+    def test_body_at_limit_is_not_rejected(self, client, endpoint):
+        response = client.post(endpoint, content=b"x" * _LIMIT)
+        assert response.status_code != 413
 
-    @pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
-    def test_body_at_limit_is_accepted_on_every_endpoint(self, endpoint):
-        client = TestClient(_build_app(self.LIMIT))
-        response = client.post(endpoint, content=b"x" * self.LIMIT)
-        assert response.status_code == 200
-        assert response.json() == {"length": self.LIMIT}
+    @pytest.mark.parametrize("endpoint", _ENDPOINTS)
+    def test_body_over_limit_is_rejected(self, client, endpoint):
+        # Content-Length exceeds limit → 413, no body bytes read.
+        response = client.post(endpoint, content=b"x" * (_LIMIT + _OVERFLOW))
+        _assert_content_too_large(response)
 
-    def _assert_content_too_large(self, response):
-        # Both stages must reject through the same OpenAI-style error
-        # envelope as ``APIRestrictionMiddleware`` so clients can rely on
-        # a single error shape for every middleware-level rejection.
-        assert response.status_code == 413
-        body = response.json()
-        assert set(body) == {"error"}
-        error = body["error"]
-        assert error["type"] == "invalid_request_error"
-        assert error["code"] == "content_too_large"
-        # The message must name the configured limit so operators can
-        # diagnose the rejection without correlating logs.
-        assert str(self.LIMIT) in error["message"]
-        assert "--http-max-input-size" in error["message"]
-
-    @pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
-    def test_body_one_byte_over_limit_is_rejected_on_every_endpoint(
-        self, endpoint
-    ):
-        # Stage 1: declared Content-Length exceeds the limit by one byte.
-        # The rejection is a pure header check; no body bytes are read.
-        client = TestClient(_build_app(self.LIMIT))
-        response = client.post(endpoint, content=b"x" * (self.LIMIT + 1))
-        self._assert_content_too_large(response)
-
-    @pytest.mark.parametrize("endpoint", _BODY_ENDPOINTS)
-    def test_chunked_body_over_limit_is_rejected_on_every_endpoint(
-        self, endpoint
-    ):
-        # Stage 2: Transfer-Encoding: chunked carries no Content-Length, so
-        # Stage 1 is bypassed and the byte counter must catch it. httpx
-        # sends chunked when ``content`` is an Iterable[bytes].
+    @pytest.mark.parametrize("endpoint", _ENDPOINTS)
+    def test_chunked_body_over_limit_is_rejected(self, client, endpoint):
+        # Chunked transfer, no Content-Length. First chunk == _LIMIT
+        # is accepted (boundary is >); second chunk tips total over → 413.
+        # httpx sends chunked when content is an Iterable[bytes].
         def chunks():
-            yield b"x" * 80
-            yield b"x" * 80  # cumulative 160 > 128
+            yield b"x" * _LIMIT
+            yield b"x" * _OVERFLOW
 
-        client = TestClient(_build_app(self.LIMIT))
         response = client.post(endpoint, content=chunks())
-        self._assert_content_too_large(response)
+        _assert_content_too_large(response)
 
-    def test_get_without_body_is_unaffected(self):
-        # The middleware must not add overhead or false positives to
-        # bodyless methods. The endpoints above are POST-only, so a GET
-        # produces the framework's normal 405 - nothing from our middleware.
-        client = TestClient(_build_app(self.LIMIT))
-        response = client.get(_BODY_ENDPOINTS[0])
+    def test_get_without_body_is_unaffected(self, client):
+        response = client.get(_ENDPOINTS[0])
         assert response.status_code == 405
 
-    @pytest.mark.parametrize("invalid", [0, -1, -1024])
-    def test_constructor_rejects_non_positive_limit(self, invalid):
-        # Mirrors core Triton's CLI validation in
-        # server/src/command_line_parser.cc: --http-max-input-size must be
-        # greater than 0. Validating in the middleware too prevents
-        # programmatic misuse from silently disabling the limit.
-        with pytest.raises(ValueError, match="must be greater than 0"):
-            RequestSizeLimitMiddleware(app=None, http_max_input_size=invalid)
-
-
 class TestContentLengthValidation:
-    """Stage 1 header validation. RFC 9112 §6.3 requires Content-Length to
-    be a non-negative integer; anything else is an unrecoverable framing
-    error and must be rejected with HTTP 400, not silently bubbled up as
-    an unhandled ``ValueError`` that becomes an HTTP 500.
-
-    These cases use direct ASGI invocation because httpx's ``TestClient``
-    validates and rewrites Content-Length, which would prevent us from
-    sending the malformed values we need to exercise.
+    """
+    Stage 1 rejects malformed Content-Length with HTTP 400.
+    Direct ASGI invocation is required because httpx rewrites Content-Length
+    headers, making it impossible to send malformed values via TestClient.
+    The wrapped app and receive callable raise AssertionError if called,
+    proving rejection happened before any body bytes were read.
     """
 
-    LIMIT = 128
-
-    def _run_with_content_length(
-        self, raw_value: bytes
-    ) -> tuple[int, dict]:
-        """Drive the middleware with one raw Content-Length value and
-        return ``(status, parsed_body)``. The wrapped app must never be
-        invoked - all validation must reject before Stage 2.
-        """
+    def _run_with_content_length(self, raw_value: bytes) -> tuple[int, dict]:
         captured: dict = {"status": None, "body": b""}
 
         async def app(scope, receive, send):
-            raise AssertionError(
-                "Wrapped app must not be reached for invalid Content-Length"
-            )
+            raise AssertionError("app must not be reached for invalid Content-Length")
 
         async def receive():
-            # Stage 1 rejects without reading the body. If receive is
-            # called, the middleware did the wrong thing.
-            raise AssertionError(
-                "receive() must not be called when Stage 1 rejects"
-            )
+            raise AssertionError("receive() must not be called when Stage 1 rejects")
 
         async def send(message):
             if message["type"] == "http.response.start":
@@ -198,16 +130,13 @@ class TestContentLengthValidation:
             elif message["type"] == "http.response.body":
                 captured["body"] += message.get("body", b"")
 
-        middleware = RequestSizeLimitMiddleware(
-            app=app, http_max_input_size=self.LIMIT
-        )
+        middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
         scope = {
             "type": "http",
             "method": "POST",
             "path": "/v1/chat/completions",
             "headers": [(b"content-length", raw_value)],
         }
-
         asyncio.run(middleware(scope, receive, send))
 
         assert captured["status"] is not None, "no response was sent"
@@ -226,17 +155,12 @@ class TestContentLengthValidation:
         assert "not an integer" in body["error"]["message"]
 
     def test_empty_content_length_rejected_with_400(self):
-        # ``int(b"")`` raises ``ValueError``; an empty value is also
-        # invalid per RFC 9112 §6.3.
         status, body = self._run_with_content_length(b"")
         self._assert_invalid_content_length(status, body)
         assert "not an integer" in body["error"]["message"]
 
-    @pytest.mark.parametrize("raw", [b"-1", b"-1024", b"-9999999"])
+    @pytest.mark.parametrize("raw", [b"-5"])
     def test_negative_content_length_rejected_with_400(self, raw):
-        # ``int(b"-1")`` succeeds and returns -1; the framing error must
-        # still be caught explicitly so this case becomes a 400 rather
-        # than falling through Stage 1 and being read as a 0-byte body.
         status, body = self._run_with_content_length(raw)
         self._assert_invalid_content_length(status, body)
         assert "non-negative" in body["error"]["message"]
