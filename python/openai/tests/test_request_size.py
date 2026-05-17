@@ -45,6 +45,9 @@ from utils.utils import HTTP_DEFAULT_MAX_INPUT_SIZE
 
 _LIMIT = HTTP_DEFAULT_MAX_INPUT_SIZE  # 64 MiB
 _OVERFLOW = 16
+
+# All POST endpoints; used for rejection tests (middleware short-circuits
+# before the mock-engine-backed handler is invoked).
 _ENDPOINTS = (
     "/v1/chat/completions",
     "/v1/completions",
@@ -53,15 +56,19 @@ _ENDPOINTS = (
     "/v1/models/test-model/unload",
 )
 
+# Subset that parses the body via Pydantic; used for the at-limit acceptance
+# test where the handler fails validation cleanly on raw bytes instead of
+# invoking the mock engine.
+_BODY_PARSING_ENDPOINTS = (
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+)
+
 
 @pytest.fixture(scope="module")
 def client():
-    """
-    FastApiFrontend with a MagicMock engine.
-    Middleware fires before any engine method is invoked, so a MagicMock
-    suffices for all rejection tests. Acceptance tests only assert != 413;
-    the handler may return 422 for the raw-bytes body, which is expected.
-    """
+    """FastApiFrontend wired with a MagicMock engine (no Triton/GPU needed)."""
     frontend = FastApiFrontend(engine=MagicMock(), http_max_input_size=_LIMIT)
     return TestClient(frontend.app)
 
@@ -78,25 +85,21 @@ def _assert_content_too_large(response) -> None:
 
 
 class TestRequestSizeLimitMiddleware:
-    """
-    Tests for RequestSizeLimitMiddleware via FastApiFrontend.
-    """
-    @pytest.mark.parametrize("endpoint", _ENDPOINTS)
+    """End-to-end coverage through FastApiFrontend with a TestClient."""
+
+    @pytest.mark.parametrize("endpoint", _BODY_PARSING_ENDPOINTS)
     def test_body_at_limit_is_not_rejected(self, client, endpoint):
         response = client.post(endpoint, content=b"x" * _LIMIT)
         assert response.status_code != 413
 
     @pytest.mark.parametrize("endpoint", _ENDPOINTS)
     def test_body_over_limit_is_rejected(self, client, endpoint):
-        # Content-Length exceeds limit → 413, no body bytes read.
         response = client.post(endpoint, content=b"x" * (_LIMIT + _OVERFLOW))
         _assert_content_too_large(response)
 
     @pytest.mark.parametrize("endpoint", _ENDPOINTS)
     def test_chunked_body_over_limit_is_rejected(self, client, endpoint):
-        # Chunked transfer, no Content-Length. First chunk == _LIMIT
-        # is accepted (boundary is >); second chunk tips total over → 413.
-        # httpx sends chunked when content is an Iterable[bytes].
+        # httpx switches to chunked transfer when content is an Iterable[bytes].
         def chunks():
             yield b"x" * _LIMIT
             yield b"x" * _OVERFLOW
@@ -108,14 +111,9 @@ class TestRequestSizeLimitMiddleware:
         response = client.get(_ENDPOINTS[0])
         assert response.status_code == 405
 
+
 class TestContentLengthValidation:
-    """
-    Stage 1 rejects malformed Content-Length with HTTP 400.
-    Direct ASGI invocation is required because httpx rewrites Content-Length
-    headers, making it impossible to send malformed values via TestClient.
-    The wrapped app and receive callable raise AssertionError if called,
-    proving rejection happened before any body bytes were read.
-    """
+    """Stage 1 rejects malformed Content-Length with 400 (direct ASGI: httpx rewrites the header)."""
 
     def _run_with_content_length(self, raw_value: bytes) -> tuple[int, dict]:
         captured: dict = {"status": None, "body": b""}
@@ -151,18 +149,65 @@ class TestContentLengthValidation:
         assert error["type"] == "invalid_request_error"
         assert error["code"] == "invalid_content_length"
 
-    def test_non_integer_content_length_rejected_with_400(self):
-        status, body = self._run_with_content_length(b"not-a-number")
+    @pytest.mark.parametrize("raw", [b"not-a-number", b""])
+    def test_non_integer_content_length_rejected_with_400(self, raw):
+        status, body = self._run_with_content_length(raw)
         self._assert_invalid_content_length(status, body)
         assert "not an integer" in body["error"]["message"]
 
-    def test_empty_content_length_rejected_with_400(self):
-        status, body = self._run_with_content_length(b"")
-        self._assert_invalid_content_length(status, body)
-        assert "not an integer" in body["error"]["message"]
-
-    @pytest.mark.parametrize("raw", [b"-5"])
+    @pytest.mark.parametrize("raw", [b"-1", b"-1024"])
     def test_negative_content_length_rejected_with_400(self, raw):
         status, body = self._run_with_content_length(raw)
         self._assert_invalid_content_length(status, body)
         assert "non-negative" in body["error"]["message"]
+
+
+class TestStreamTermination:
+    """Stage 2 must abort silently (no app invocation, no response) on disconnect or unexpected message types."""
+
+    def _run(self, messages: list) -> tuple[bool, bool]:
+        app_invoked = False
+        response_sent = False
+
+        async def app(scope, receive, send):
+            nonlocal app_invoked
+            app_invoked = True
+
+        queue = list(messages)
+
+        async def receive():
+            assert queue, "middleware called receive() more times than expected"
+            return queue.pop(0)
+
+        async def send(message):
+            nonlocal response_sent
+            response_sent = True
+
+        middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+        }
+        asyncio.run(middleware(scope, receive, send))
+        return app_invoked, response_sent
+
+    @pytest.mark.parametrize(
+        "messages",
+        [
+            pytest.param([{"type": "http.disconnect"}], id="disconnect_before_body"),
+            pytest.param(
+                [
+                    {"type": "http.request", "body": b"x" * 100, "more_body": True},
+                    {"type": "http.disconnect"},
+                ],
+                id="disconnect_mid_body",
+            ),
+            pytest.param([{"type": "http.unexpected"}], id="unknown_message_type"),
+        ],
+    )
+    def test_terminates_silently(self, messages):
+        app_invoked, response_sent = self._run(messages)
+        assert not app_invoked
+        assert not response_sent
