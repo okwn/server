@@ -952,7 +952,7 @@ curl -H "api-key: my-secret-key" \
 
 ## HTTP Request Body Size Limit
 
-The frontend enforces a maximum request body size prior to JSON parsing. Requests that exceed this limit are rejected with an OpenAI-style error response.
+The frontend enforces a maximum request body size prior to JSON parsing. Requests that exceed this limit are rejected with an error response.
 
 Use `--http-max-input-size` to configure the limit (default: `67108864` bytes / 64 MiB):
 
