@@ -950,17 +950,11 @@ curl -H "api-key: my-secret-key" \
 --openai-restricted-api "inference,model-repository shared-key shared-secret"
 ```
 
-## Limit HTTP Request Body Size
+## HTTP Request Body Size Limit
 
-The OpenAI-compatible frontend rejects requests whose body exceeds the
-configured limit *before* FastAPI deserializes the JSON into Python
-objects. Without this cap a single oversized request can OOM-kill the
-worker, because Pydantic/JSON parsing typically amplifies the body's
-memory footprint by roughly 8x.
+The frontend enforces a maximum request body size prior to JSON parsing. Requests that exceed this limit are rejected with an OpenAI-style error response.
 
-### Configuration
-
-Use the `--http-max-input-size` command-line argument:
+Use `--http-max-input-size` to configure the limit (default: `67108864` bytes / 64 MiB):
 
 ```bash
 python3 openai_frontend/main.py \
@@ -969,23 +963,7 @@ python3 openai_frontend/main.py \
   --http-max-input-size 67108864
 ```
 
-- **Default**: `67108864` bytes (64 MiB), matching core Triton's
-  `--http-max-input-size`.
-- **Units**: bytes; must be a positive integer.
-- **Scope**: applies to every endpoint registered on the frontend
-  (`/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`,
-  `/v1/models/*`, `/health/ready`, `/metrics`, ...) without per-route
-  wiring.
-
-### Rejection Behavior
-
-| Condition | HTTP status | `error.code` |
-| --- | --- | --- |
-| `Content-Length` header exceeds the limit | `413 Content Too Large` | `content_too_large` |
-| `Transfer-Encoding: chunked` body exceeds the limit during streaming | `413 Content Too Large` | `content_too_large` |
-| `Content-Length` is not an integer or is negative | `400 Bad Request` | `invalid_content_length` |
-
-All rejections use the OpenAI-style error envelope:
+The limit applies to all endpoints. Example error response:
 
 ```json
 {
@@ -996,10 +974,3 @@ All rejections use the OpenAI-style error envelope:
   }
 }
 ```
-
-### Defense in Depth
-
-This middleware is the application-layer defense. For production
-deployments behind a reverse proxy, also configure a body-size limit
-there (e.g., nginx `client_max_body_size`) so traffic is rejected at the
-network boundary before reaching the Python process.
