@@ -119,12 +119,17 @@ class RequestSizeLimitMiddleware:
 
         async def replay_receive() -> Message:
             nonlocal body_message
-            if body_message is None:
-                return {"type": "http.disconnect"}
-            # Drop the reference on hand-off so the body is freed while the
-            # application processes it, instead of being held by this closure.
-            message, body_message = body_message, None
-            return message
+            if body_message is not None:
+                # Drop the reference on hand-off so the body is freed while
+                # the app processes it, instead of being held by this closure.
+                message, body_message = body_message, None
+                return message
+            # Body already delivered — delegate to the original receive() so
+            # streaming responses can wait for the real client disconnect.
+            # Returning http.disconnect here would make Starlette abort the
+            # response prematurely (see ASGI StreamingResponse disconnect
+            # listener).
+            return await receive()
 
         await self.app(scope, replay_receive, send)
 

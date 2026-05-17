@@ -162,6 +162,47 @@ class TestContentLengthValidation:
         assert "non-negative" in body["error"]["message"]
 
 
+class TestStreamingDisconnectListener:
+    """
+    After the body is delivered, replay_receive must delegate to the original
+    receive() so streaming responses (SSE chat/completions) can wait for the
+    real client disconnect instead of being aborted by a premature
+    http.disconnect from the middleware.
+    """
+
+    def test_subsequent_receive_delegates_to_original(self):
+        seen: list[str] = []
+        upstream_queue = [
+            {"type": "http.request", "body": b"hello", "more_body": False},
+            {"type": "http.disconnect"},  # arrives later, simulating client hang-up
+        ]
+
+        async def receive():
+            assert upstream_queue, "middleware exhausted original receive() queue"
+            return upstream_queue.pop(0)
+
+        async def send(_message):
+            pass
+
+        async def app(scope, app_receive, app_send):
+            seen.append((await app_receive())["type"])
+            # Second call must delegate to original receive() and return the
+            # queued disconnect, not a synthetic disconnect from the closure.
+            seen.append((await app_receive())["type"])
+
+        middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [(b"content-length", b"5")],
+        }
+        asyncio.run(middleware(scope, receive, send))
+
+        assert seen == ["http.request", "http.disconnect"]
+        assert upstream_queue == [], "original receive() was not delegated to"
+
+
 class TestStreamTermination:
     """Stage 2 must abort silently (no app invocation, no response) on disconnect or unexpected message types."""
 
