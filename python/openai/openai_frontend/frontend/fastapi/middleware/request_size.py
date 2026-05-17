@@ -34,16 +34,16 @@ from utils.utils import StatusCode, validate_positive_int
 logger = logging.getLogger(__name__)
 
 
-class _BodyTooLargeError(Exception):
+class _ContentTooLargeError(Exception):
     pass
 
 
 class RequestSizeLimitMiddleware:
-    """ASGI middleware that enforces a hard cap on HTTP request body size.
-
-    Stage 1 — Content-Length present: reject before reading any body bytes.
-    Stage 2 — Chunked/HTTP2/no Content-Length: count bytes as they arrive
-               and reject as soon as the running total exceeds the limit.
+    """
+    ASGI middleware that enforces a hard cap on HTTP request body size.
+    If Content-Length present: reject before reading any body bytes.
+    If chunked/HTTP2/no Content-Length: count bytes as they arrive 
+    and reject as soon as the running total exceeds the limit.
     """
 
     def __init__(self, app: ASGIApp, http_max_input_size: int) -> None:
@@ -100,7 +100,7 @@ class RequestSizeLimitMiddleware:
                 return message
             received += len(message.get("body", b""))
             if received > self.http_max_input_size:
-                raise _BodyTooLargeError()
+                raise _ContentTooLargeError()
             return message
 
         response_started = False
@@ -113,7 +113,7 @@ class RequestSizeLimitMiddleware:
 
         try:
             await self.app(scope, counting_receive, send_wrapper)
-        except _BodyTooLargeError:
+        except _ContentTooLargeError:
             if not response_started:
                 await self._send_error(
                     scope, send,
@@ -126,10 +126,10 @@ class RequestSizeLimitMiddleware:
                     ),
                 )
             else:
-                # Response headers already sent; cannot issue 413.
+                # content size exceeded after response headers sent; cannot send error response.
                 logger.error(
-                    "Body limit exceeded after response already started; "
-                    "cannot send 413. path=%s",
+                    "Content size limit exceeded after response started. "
+                    "Unable to send error response. path=%s",
                     scope.get("path", "?"),
                 )
 
@@ -137,7 +137,6 @@ class RequestSizeLimitMiddleware:
         self,
         scope: Scope,
         send: Send,
-        *,
         status_code: StatusCode,
         code: str,
         message: str,
