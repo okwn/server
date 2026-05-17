@@ -204,7 +204,7 @@ def parse_args():
         default=HTTP_DEFAULT_MAX_INPUT_SIZE,
         help=f"Maximum allowed HTTP request input size in bytes for the OpenAI "
         f"frontend (default: {HTTP_DEFAULT_MAX_INPUT_SIZE}, i.e. 64 MiB). "
-        "Requests above this limit are rejected.",
+        "Requests exceeding this limit will be rejected.",
     )
 
     # KServe Predict v2 Frontend
