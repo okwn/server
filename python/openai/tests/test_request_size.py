@@ -24,7 +24,6 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Tests for RequestSizeLimitMiddleware via FastApiFrontend."""
 
 import asyncio
 import json
@@ -79,6 +78,9 @@ def _assert_content_too_large(response) -> None:
 
 
 class TestRequestSizeLimitMiddleware:
+    """
+    Tests for RequestSizeLimitMiddleware via FastApiFrontend.
+    """
     @pytest.mark.parametrize("endpoint", _ENDPOINTS)
     def test_body_at_limit_is_not_rejected(self, client, endpoint):
         response = client.post(endpoint, content=b"x" * _LIMIT)
