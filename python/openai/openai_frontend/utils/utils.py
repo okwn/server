@@ -51,11 +51,11 @@ class StatusCode(IntEnum):
     SERVER_ERROR = 500
 
 
-def validate_positive_int(value: object) -> int:
+def validate_positive_int(value: object) -> int:    
     try:
         ivalue = int(value)
     except (TypeError, ValueError):
         raise ValueError(f"value is not an integer, got {value!r}")
     if ivalue <= 0:
-        raise ValueError(f"value must be greater than 0, got {ivalue}")
+        raise ValueError(f"value must be greater than 0, got {value!r}")
     return ivalue

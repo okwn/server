@@ -30,9 +30,9 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
+import tritonserver
 from fastapi.testclient import TestClient
 
 sys.path.append(
@@ -40,37 +40,38 @@ sys.path.append(
 )
 
 from frontend.fastapi.middleware.request_size import RequestSizeLimitMiddleware
-from frontend.fastapi_frontend import FastApiFrontend
+from tests.utils import setup_fastapi_app, setup_server
 from utils.utils import HTTP_DEFAULT_MAX_INPUT_SIZE
 
 _LIMIT = HTTP_DEFAULT_MAX_INPUT_SIZE  # 64 MiB
-_OVERFLOW = 16
+_OVERFLOW = 16  # bytes
+_MODEL = "mock_llm"
 
-# All POST endpoints; used for rejection tests (middleware short-circuits
-# before the mock-engine-backed handler is invoked).
+# All POST endpoints.
 _ENDPOINTS = (
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/embeddings",
-    "/v1/models/test-model/load",
-    "/v1/models/test-model/unload",
-)
-
-# Subset that parses the body via Pydantic; used for the at-limit acceptance
-# test where the handler fails validation cleanly on raw bytes instead of
-# invoking the mock engine.
-_BODY_PARSING_ENDPOINTS = (
-    "/v1/chat/completions",
-    "/v1/completions",
-    "/v1/embeddings",
+    f"/v1/models/{_MODEL}/load",
+    f"/v1/models/{_MODEL}/unload",
 )
 
 
 @pytest.fixture(scope="module")
 def client():
-    """FastApiFrontend wired with a MagicMock engine (no Triton/GPU needed)."""
-    frontend = FastApiFrontend(engine=MagicMock(), http_max_input_size=_LIMIT)
-    return TestClient(frontend.app)
+    """FastApiFrontend backed by a real Triton server with mock_llm loaded."""
+    model_repository = str(Path(__file__).parent / "test_models")
+    server = setup_server(
+        model_repository,
+        model_control_mode=tritonserver.ModelControlMode.EXPLICIT,
+        load_models=[_MODEL],
+    )
+    try:
+        app = setup_fastapi_app(tokenizer="", server=server, backend=None)
+        with TestClient(app) as test_client:
+            yield test_client
+    finally:
+        server.stop()
 
 
 def _assert_content_too_large(response) -> None:
@@ -85,9 +86,7 @@ def _assert_content_too_large(response) -> None:
 
 
 class TestRequestSizeLimitMiddleware:
-    """End-to-end coverage through FastApiFrontend with a TestClient."""
-
-    @pytest.mark.parametrize("endpoint", _BODY_PARSING_ENDPOINTS)
+    @pytest.mark.parametrize("endpoint", _ENDPOINTS)
     def test_body_at_limit_is_not_rejected(self, client, endpoint):
         response = client.post(endpoint, content=b"x" * _LIMIT)
         assert response.status_code != 413
@@ -113,7 +112,7 @@ class TestRequestSizeLimitMiddleware:
 
 
 class TestContentLengthValidation:
-    """Stage 1 rejects malformed Content-Length with 400 (direct ASGI: httpx rewrites the header)."""
+    """Stage 1 rejects malformed Content-Length with 400."""
 
     def _run_with_content_length(self, raw_value: bytes) -> tuple[int, dict]:
         captured: dict = {"status": None, "body": b""}
@@ -162,15 +161,24 @@ class TestContentLengthValidation:
         assert "non-negative" in body["error"]["message"]
 
 
-class TestStreamingDisconnectListener:
+class TestAsgiLifecycleInvariants:
     """
-    After the body is delivered, replay_receive must delegate to the original
-    receive() so streaming responses (SSE chat/completions) can wait for the
-    real client disconnect instead of being aborted by a premature
-    http.disconnect from the middleware.
+    Subtle ASGI invariants that, if regressed, cause silent production bugs.
+    Do not delete without understanding the matching comments in
+    `request_size.py`; both invariants are documented at the call sites.
+
+    1. After Stage 2 hands the buffered body to the app, replay_receive must
+       delegate to the original receive() so streaming responses
+       (e.g. /v1/chat/completions?stream=true) can detect the real client
+       disconnect and stop generating tokens. Returning a synthetic
+       disconnect aborts every SSE response prematurely.
+
+    2. On http.disconnect or any unexpected message type during body reading,
+       the middleware must abort silently: never invoke the app with a
+       partial body, never write to a closed socket.
     """
 
-    def test_subsequent_receive_delegates_to_original(self):
+    def test_replay_receive_delegates_to_original_after_body(self):
         seen: list[str] = []
         upstream_queue = [
             {"type": "http.request", "body": b"hello", "more_body": False},
@@ -186,8 +194,8 @@ class TestStreamingDisconnectListener:
 
         async def app(scope, app_receive, app_send):
             seen.append((await app_receive())["type"])
-            # Second call must delegate to original receive() and return the
-            # queued disconnect, not a synthetic disconnect from the closure.
+            # Second call must delegate to the original receive() and return
+            # the queued disconnect, not a synthetic one from the closure.
             seen.append((await app_receive())["type"])
 
         middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
@@ -201,38 +209,6 @@ class TestStreamingDisconnectListener:
 
         assert seen == ["http.request", "http.disconnect"]
         assert upstream_queue == [], "original receive() was not delegated to"
-
-
-class TestStreamTermination:
-    """Stage 2 must abort silently (no app invocation, no response) on disconnect or unexpected message types."""
-
-    def _run(self, messages: list) -> tuple[bool, bool]:
-        app_invoked = False
-        response_sent = False
-
-        async def app(scope, receive, send):
-            nonlocal app_invoked
-            app_invoked = True
-
-        queue = list(messages)
-
-        async def receive():
-            assert queue, "middleware called receive() more times than expected"
-            return queue.pop(0)
-
-        async def send(message):
-            nonlocal response_sent
-            response_sent = True
-
-        middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
-        scope = {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-        }
-        asyncio.run(middleware(scope, receive, send))
-        return app_invoked, response_sent
 
     @pytest.mark.parametrize(
         "messages",
@@ -248,7 +224,32 @@ class TestStreamTermination:
             pytest.param([{"type": "http.unexpected"}], id="unknown_message_type"),
         ],
     )
-    def test_terminates_silently(self, messages):
-        app_invoked, response_sent = self._run(messages)
+    def test_terminates_silently_on_disconnect_or_unknown_message(self, messages):
+        app_invoked = False
+        response_sent = False
+
+        async def app(scope, receive, send):
+            nonlocal app_invoked
+            app_invoked = True
+
+        queue = list(messages)
+
+        async def receive():
+            assert queue, "middleware called receive() more times than expected"
+            return queue.pop(0)
+
+        async def send(_message):
+            nonlocal response_sent
+            response_sent = True
+
+        middleware = RequestSizeLimitMiddleware(app=app, http_max_input_size=_LIMIT)
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+        }
+        asyncio.run(middleware(scope, receive, send))
+
         assert not app_invoked
         assert not response_sent
