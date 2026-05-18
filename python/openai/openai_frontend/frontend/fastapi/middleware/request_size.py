@@ -38,8 +38,8 @@ class RequestSizeLimitMiddleware:
     """
     Reject HTTP requests whose body exceeds ``http_max_input_size`` bytes.
 
-    Stage 1 rejects on the Content-Length header before any body bytes are
-    read. Stage 2 streams the body chunks, counting bytes as they arrive,
+    First validation rejects on the Content-Length header before any body bytes are
+    read. Second validation streams the body chunks, counting bytes as they arrive,
     and rejects as soon as the running total crosses the limit. Driving
     receive() from the middleware protects every endpoint, including
     handlers that never read the body. The buffered body is released the
@@ -50,7 +50,7 @@ class RequestSizeLimitMiddleware:
     def __init__(self, app: ASGIApp, http_max_input_size: int) -> None:
         self.app = app
         self.http_max_input_size = validate_positive_int(http_max_input_size)
-        self._too_large_message = (
+        self._content_too_large_message = (
             "Request content size exceeds the maximum allowed input size of "
             f"{self.http_max_input_size} bytes. "
             "Use --http-max-input-size to increase the limit."
@@ -82,7 +82,7 @@ class RequestSizeLimitMiddleware:
             if content_length > self.http_max_input_size:
                 await self._send_error(
                     scope, send, StatusCode.CONTENT_TOO_LARGE, "content_too_large",
-                    self._too_large_message,
+                    self._content_too_large_message,
                 )
                 return
             break
@@ -93,16 +93,13 @@ class RequestSizeLimitMiddleware:
         while True:
             message = await receive()
             if message["type"] != "http.request":
-                # Disconnect or unexpected message — abort silently; the client
-                # is not there to receive a response, and treating unknown
-                # types as terminal prevents an infinite receive() loop.
                 return
             chunk = message.get("body", b"")
             total += len(chunk)
             if total > self.http_max_input_size:
                 await self._send_error(
                     scope, send, StatusCode.CONTENT_TOO_LARGE, "content_too_large",
-                    self._too_large_message,
+                    self._content_too_large_message,
                 )
                 return
             body_chunks.append(chunk)
@@ -126,9 +123,6 @@ class RequestSizeLimitMiddleware:
                 return message
             # Body already delivered — delegate to the original receive() so
             # streaming responses can wait for the real client disconnect.
-            # Returning http.disconnect here would make Starlette abort the
-            # response prematurely (see ASGI StreamingResponse disconnect
-            # listener).
             return await receive()
 
         await self.app(scope, replay_receive, send)
