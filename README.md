@@ -296,3 +296,8 @@ For questions, we recommend posting in our community
 
 Please refer to the [NVIDIA Developer Triton page](https://developer.nvidia.com/nvidia-triton-inference-server)
 for more information.
+
+## Contributing
+PRs welcome!
+
+> Main branch: [main](./tree/main) | Legacy: [master-v1](./tree/master-v1)
